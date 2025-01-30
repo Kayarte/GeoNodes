@@ -1,0 +1,14 @@
+[project]
+name = "geonodes"
+description = "GIS Processing Nodes for ComfyUI"
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/Kayarte/GeoNodes"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "GeoNodes"
+Icon = ""
