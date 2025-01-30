@@ -1,6 +1,6 @@
 GeoNodes:
 
-GeoNodes is an open-source collection of GIS processing nodes for ComfyUI, aimed at bringing professional GIS capabilities into the AI workflow space. Our goal is to create a free, accessible alternative to traditional GIS software while enabling seamless integration with modern AI technologies.
+GeoNodes is an open-source collection of GIS processing nodes for ComfyUI, aimed at bringing professional GIS capabilities into the AI workflow space. My goal is to create a free, accessible alternative to traditional GIS software while enabling seamless integration with modern AI technologies.
 
 Vision:
 
