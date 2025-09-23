@@ -1,27 +1,26 @@
-GeoNodes:
+GeoDetect-ComfyUI
+AI-powered object detection for geospatial imagery in ComfyUI. Process satellite, aerial, and drone imagery while preserving real-world coordinates.
+What It Does
+This node brings YOLO-style object detection to GIS workflows. It automatically tiles large geospatial images, runs detection models, and maintains geographic coordinates throughout - so you know exactly where objects were detected, not just what they are.
+Perfect for:
 
-GeoNodes is an open-source collection of GIS processing nodes for ComfyUI, aimed at bringing professional GIS capabilities into the AI workflow space. My goal is to create a free, accessible alternative to traditional GIS software while enabling seamless integration with modern AI technologies.
+🛰️ Detecting objects in satellite imagery (buildings, vehicles, infrastructure)
+🚁 Processing drone surveys with geographic accuracy
+🗺️ Creating detection heatmaps with real-world coordinates
+📊 Counting features across large aerial images
 
-Vision:
+Key Features
 
-Transform geospatial analysis by bridging the gap between traditional GIS processing and modern AI workflows. GeoNodes makes professional GIS capabilities accessible to everyone while adding the power of AI integration.
+Smart Tiling: Automatically splits massive GeoTIFF files into processable chunks
+Coordinate Preservation: Maintains geographic metadata (CRS, bounds, transforms)
+Memory Optimized: Designed for 8GB VRAM systems
+Multiple Tiling Schemes: Simple grid, Web Mercator, or UTM projections
+Auto Model Detection: Supports bbox, segmentation, and keypoint models
+Parallel Processing: Process multiple images simultaneously
 
+How It Works
 
-Current Features:
-
-🗺️ Professional GIS Object Detection
-
-    Multiple tiling schemes (Simple, Mercator, UTM)
-
-    Memory-optimized processing
-
-    Automatic model type detection
-
-    Parallel processing support
-
-
-
-
-Coming Soon
-
-    📊 Advanced GIS Processing
+Input: Large geospatial image (GeoTIFF, etc.)
+Tiling: Splits into overlapping tiles (default 512x512px)
+Detection: Runs YOLO/Ultralytics models on each tile
+Output: Detections with preserved geographic coordinates
