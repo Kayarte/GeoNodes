@@ -8,6 +8,11 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import psutil
 import math
+from ultralytics import YOLO
+from torchvision.ops import nms
+import cv2
+from PIL import Image
+import json
 
 class GISDetectionNode:
     """
@@ -17,270 +22,328 @@ class GISDetectionNode:
     
     def __init__(self):
         self.CATEGORY = "GIS"
-        self.RETURN_TYPES = ("TENSOR", "METADATA")
-        self.RETURN_NAMES = ("detection_output", "geo_metadata")
-        
+        self.RETURN_TYPES = ("STRING", "STRING", "STRING")
+        self.RETURN_NAMES = ("annotated_image_path", "detections_json", "status")
+
         # Memory constraints (in MB)
         self.MAX_VRAM = 7000  # Leave 1GB buffer for system
         self.MAX_RAM = 28000  # Leave 4GB buffer for system
+
+        self.model = None
+        self.current_model_path = None
         
     @classmethod
     def INPUT_TYPES(cls):
         """Define input types with memory-aware defaults"""
-        # Get available models
-        base_dir = os.path.join('models', 'ultralytics')
-        all_models = []
-        
-        if os.path.exists(base_dir):
-            for root, _, files in os.walk(base_dir):
-                for file in files:
-                    if file.endswith(('.pt', '.pth', '.onnx')):
-                        rel_path = os.path.relpath(os.path.join(root, file), base_dir)
-                        model_name = os.path.splitext(rel_path)[0]
-                        all_models.append(model_name)
-        
         return {
             "required": {
-                "input_path": ("STRING", {"default": ""}),
-                "model_name": (sorted(all_models), {"default": all_models[0] if all_models else ""}),
-                "input_type": (["single_image", "directory"], {"default": "single_image"}),
-                "tile_scheme": (["SIMPLE", "MERCATOR", "UTM"], {"default": "SIMPLE"})
+                "input_image_path": ("STRING", {"default": ""}),
+                "model_path": ("STRING", {"default": ""}),
+                "tile_size": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 32}),
+                "overlap_percent": ("INT", {"default": 50, "min": 0, "max": 75, "step": 5}),
+                "confidence_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "iou_threshold": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "device": (["cuda", "cpu", "mps"], {"default": "cuda"}),
             },
             "optional": {
-                # Processing options
-                "use_parallel": ("BOOLEAN", {"default": True}),
-                "max_parallel_images": ("INT", {"default": 4, "min": 1, "max": 16}),
-                "confidence_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0}),
-                # Tiling options
-                "tile_size": ("INT", {"default": 512, "min": 256, "max": 1024}),
-                "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 256}),
-                "maintain_aspect": ("BOOLEAN", {"default": True}),
-                # Memory options
-                "memory_limit_mb": ("INT", {"default": 2048, "min": 1024, "max": 4096}),
-                "image_extensions": ("STRING", {"default": ".tif,.tiff,.jpg,.png"})
+                "output_dir": ("STRING", {"default": "output"}),
+                "save_tiles": ("BOOLEAN", {"default": False}),
+                "draw_labels": ("BOOLEAN", {"default": True}),
+                "draw_conf": ("BOOLEAN", {"default": True}),
             }
         }
 
-    def detect_model_type(self, model_path):
-        """Automatically detect model type from the model file"""
-        try:
-            model = torch.load(model_path, map_location='cpu')
-            
-            if hasattr(model, 'task'):
-                task = model.task
-                if task == 'detect':
-                    return 'bbox'
-                elif task in ['segment', 'segmentation']:
-                    return 'segmentation'
-                elif task == 'pose':
-                    return 'keypoints'
-                else:
-                    return task
-            
-            return 'bbox'  # Default to bbox if cannot determine
-            
-        except Exception as e:
-            print(f"Error detecting model type: {e}")
-            return 'bbox'
+    def load_model(self, model_path, device):
+        """Load YOLO model with caching"""
+        if self.model is None or self.current_model_path != model_path:
+            print(f"Loading YOLO model from: {model_path}")
 
-    def create_tile_scheme(self, src, scheme_type, tile_size, tile_overlap):
-        """Create appropriate tiling scheme based on input type"""
-        scheme = {
-            'type': scheme_type,
-            'crs': src.crs.to_string(),
-            'bounds': src.bounds,
-            'transform': src.transform,
-            'tile_size': tile_size,
-            'overlap': tile_overlap,
-            'original_size': (src.width, src.height)
-        }
-        
-        if scheme_type == "MERCATOR":
-            # Add Web Mercator specific info
-            bounds = transform_bounds(src.crs, CRS.from_epsg(3857), *src.bounds)
-            scheme['mercator_bounds'] = bounds
-            scheme['zoom_level'] = self.calculate_zoom_level(bounds, tile_size)
-            
-        elif scheme_type == "UTM":
-            # Add UTM zone specific info
-            center_x = (src.bounds.left + src.bounds.right) / 2
-            center_y = (src.bounds.bottom + src.bounds.top) / 2
-            utm_zone = math.floor((center_x + 180) / 6) + 1
-            hemisphere = 'N' if center_y >= 0 else 'S'
-            scheme['utm_zone'] = utm_zone
-            scheme['hemisphere'] = hemisphere
-            
-        return scheme
+            # Check device availability
+            if device == "cuda" and not torch.cuda.is_available():
+                print("CUDA not available, falling back to CPU")
+                device = "cpu"
+            elif device == "mps" and not torch.backends.mps.is_available():
+                print("MPS not available, falling back to CPU")
+                device = "cpu"
 
-    def calculate_zoom_level(self, bounds, tile_size):
-        """Calculate appropriate zoom level for mercator tiles"""
-        x_min, y_min, x_max, y_max = bounds
-        width = x_max - x_min
-        resolution = width / tile_size
-        zoom = math.floor(math.log2(40075016.686 / (resolution * 256)))
-        return max(0, min(zoom, 20))
+            self.model = YOLO(model_path)
+            self.current_model_path = model_path
 
-    def generate_tiles(self, src, scheme):
-        """Generate tiles based on scheme"""
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+
+        return self.model, device
+
+    def generate_tiles_with_overlap(self, image, tile_size, overlap_percent):
+        """Generate overlapping tiles from image with proper stride calculation"""
+        height, width = image.shape[:2]
+
+        # Calculate stride based on overlap percentage
+        stride = int(tile_size * (1 - overlap_percent / 100))
+
         tiles = []
-        tile_size = scheme['tile_size']
-        overlap = scheme['overlap']
-        
-        # Calculate effective tile size
-        effective_size = tile_size - overlap
-        
-        # Calculate number of tiles
-        n_tiles_y = math.ceil(src.height / effective_size)
-        n_tiles_x = math.ceil(src.width / effective_size)
-        
-        for ty in range(n_tiles_y):
-            for tx in range(n_tiles_x):
+
+        # Generate tiles with overlap
+        for y in range(0, height, stride):
+            for x in range(0, width, stride):
                 # Calculate tile bounds
-                x_start = tx * effective_size
-                y_start = ty * effective_size
-                x_end = min(x_start + tile_size, src.width)
-                y_end = min(y_start + tile_size, src.height)
-                
-                # Read tile data
-                tile_data = src.read(window=((y_start, y_end), (x_start, x_end)))
-                
-                # Create tile metadata
-                tile_meta = {
-                    'tile_coords': (tx, ty),
-                    'pixel_bounds': (x_start, y_start, x_end, y_end),
-                    'geo_bounds': src.transform * (x_start, y_start, x_end, y_end),
-                    'size': (y_end - y_start, x_end - x_start)
+                x_end = min(x + tile_size, width)
+                y_end = min(y + tile_size, height)
+
+                # Adjust start if we're at the edge to maintain tile_size
+                x_start = max(0, x_end - tile_size)
+                y_start = max(0, y_end - tile_size)
+
+                # Extract tile
+                tile = image[y_start:y_end, x_start:x_end]
+
+                # Store tile with metadata
+                tile_info = {
+                    'tile': tile,
+                    'x_offset': x_start,
+                    'y_offset': y_start,
+                    'width': x_end - x_start,
+                    'height': y_end - y_start
                 }
-                
-                tiles.append((tile_data, tile_meta))
-        
+
+                tiles.append(tile_info)
+
+        print(f"Generated {len(tiles)} tiles from {width}x{height} image (tile_size={tile_size}, overlap={overlap_percent}%)")
         return tiles
 
-    def process_tile(self, tile_data, model_type):
-        """Process individual tile data"""
-        # Convert to tensor if needed
-        if not isinstance(tile_data, torch.Tensor):
-            tile_data = torch.from_numpy(tile_data)
-        
-        # Normalize and format
-        if tile_data.max() > 1.0:
-            tile_data = tile_data / 255.0
-            
-        # Ensure CHW format
-        if tile_data.shape[0] not in [1, 3]:
-            tile_data = tile_data.permute(2, 0, 1)
-            
-        # Add batch dimension if needed
-        if len(tile_data.shape) == 3:
-            tile_data = tile_data.unsqueeze(0)
-        
-        return tile_data
+    def run_detection_on_tile(self, model, tile, x_offset, y_offset, conf_threshold, device):
+        """Run YOLO detection on a single tile and transform coordinates to global space"""
+        # Run YOLO inference
+        results = model(tile, conf=conf_threshold, device=device, verbose=False)
 
-    def process_image(self, image_path, model_name, tile_scheme="SIMPLE", 
-                     tile_size=512, tile_overlap=64, memory_limit_mb=2048):
-        """Process a single image with tiling"""
-        # Get model path and type
-        model_path = os.path.join('models', 'ultralytics', model_name)
-        if not os.path.exists(model_path):
-            for ext in ['.pt', '.pth', '.onnx']:
-                if os.path.exists(model_path + ext):
-                    model_path += ext
-                    break
-        
-        model_type = self.detect_model_type(model_path)
-        
-        with rasterio.open(image_path) as src:
-            # Create tiling scheme
-            scheme = self.create_tile_scheme(src, tile_scheme, tile_size, tile_overlap)
-            
+        detections = []
+
+        if len(results) > 0:
+            result = results[0]
+
+            if result.boxes is not None and len(result.boxes) > 0:
+                boxes = result.boxes
+
+                for i in range(len(boxes)):
+                    # Get box coordinates (xyxy format)
+                    box_xyxy = boxes.xyxy[i].cpu().numpy()
+
+                    # Transform to global coordinates
+                    x1_global = box_xyxy[0] + x_offset
+                    y1_global = box_xyxy[1] + y_offset
+                    x2_global = box_xyxy[2] + x_offset
+                    y2_global = box_xyxy[3] + y_offset
+
+                    detection = {
+                        'bbox': [float(x1_global), float(y1_global), float(x2_global), float(y2_global)],
+                        'confidence': float(boxes.conf[i].cpu().numpy()),
+                        'class_id': int(boxes.cls[i].cpu().numpy()),
+                        'class_name': result.names[int(boxes.cls[i])] if hasattr(result, 'names') else str(int(boxes.cls[i]))
+                    }
+
+                    detections.append(detection)
+
+        return detections
+
+    def apply_nms_to_detections(self, detections, iou_threshold):
+        """Apply Non-Maximum Suppression to remove duplicate detections from overlapping tiles"""
+        if len(detections) == 0:
+            return []
+
+        # Convert to tensors for NMS
+        boxes = torch.tensor([d['bbox'] for d in detections], dtype=torch.float32)
+        scores = torch.tensor([d['confidence'] for d in detections], dtype=torch.float32)
+
+        # Apply NMS
+        keep_indices = nms(boxes, scores, iou_threshold)
+
+        # Filter detections
+        filtered_detections = [detections[i] for i in keep_indices.tolist()]
+
+        print(f"NMS: {len(detections)} detections -> {len(filtered_detections)} after merging (IoU threshold={iou_threshold})")
+
+        return filtered_detections
+
+    def draw_detections_on_image(self, image, detections, draw_labels=True, draw_conf=True):
+        """Draw bounding boxes and labels on the image"""
+        annotated_image = image.copy()
+
+        # Generate colors for different classes
+        class_ids = set(d['class_id'] for d in detections)
+        colors = {}
+        for class_id in class_ids:
+            # Generate a unique color for each class
+            np.random.seed(class_id)
+            colors[class_id] = tuple(np.random.randint(0, 255, 3).tolist())
+
+        for detection in detections:
+            bbox = detection['bbox']
+            x1, y1, x2, y2 = map(int, bbox)
+            class_id = detection['class_id']
+            class_name = detection['class_name']
+            confidence = detection['confidence']
+
+            # Draw bounding box
+            color = colors[class_id]
+            cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+
+            # Draw label
+            if draw_labels or draw_conf:
+                label_parts = []
+                if draw_labels:
+                    label_parts.append(class_name)
+                if draw_conf:
+                    label_parts.append(f"{confidence:.2f}")
+
+                label = " ".join(label_parts)
+
+                # Get label size
+                (label_width, label_height), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                )
+
+                # Draw label background
+                cv2.rectangle(
+                    annotated_image,
+                    (x1, y1 - label_height - baseline - 5),
+                    (x1 + label_width, y1),
+                    color,
+                    -1
+                )
+
+                # Draw label text
+                cv2.putText(
+                    annotated_image,
+                    label,
+                    (x1, y1 - baseline - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+
+        return annotated_image
+
+    def run(self, input_image_path, model_path, tile_size=512, overlap_percent=50,
+            confidence_threshold=0.25, iou_threshold=0.45, device="cuda",
+            output_dir="output", save_tiles=False, draw_labels=True, draw_conf=True):
+        """Main execution method for GIS detection pipeline"""
+
+        try:
+            # Validate inputs
+            if not os.path.exists(input_image_path):
+                raise ValueError(f"Input image not found: {input_image_path}")
+            if not os.path.exists(model_path):
+                raise ValueError(f"Model not found: {model_path}")
+
+            # Load model
+            model, device = self.load_model(model_path, device)
+
+            # Load image (support both regular images and GeoTIFF)
+            try:
+                # Try loading as GeoTIFF first
+                with rasterio.open(input_image_path) as src:
+                    image = src.read()
+                    # Convert from (C, H, W) to (H, W, C)
+                    if image.shape[0] in [1, 3, 4]:
+                        image = np.transpose(image, (1, 2, 0))
+                    # Handle multi-band images
+                    if image.shape[2] > 3:
+                        image = image[:, :, :3]
+                    # Normalize if needed
+                    if image.max() > 255:
+                        image = ((image - image.min()) / (image.max() - image.min()) * 255).astype(np.uint8)
+                    else:
+                        image = image.astype(np.uint8)
+            except:
+                # Fall back to regular image loading
+                image = cv2.imread(input_image_path)
+                if image is None:
+                    raise ValueError(f"Failed to load image: {input_image_path}")
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            print(f"Loaded image: {image.shape}")
+
             # Generate tiles
-            tiles = self.generate_tiles(src, scheme)
-            
-            # Process tiles
-            processed_tiles = []
-            tile_metadata = []
-            
-            for tile_data, tile_meta in tiles:
-                processed_tile = self.process_tile(tile_data, model_type)
-                processed_tiles.append(processed_tile)
-                tile_metadata.append({
-                    **tile_meta,
-                    'model_type': model_type,
-                    'scheme': scheme
-                })
-            
-            # Stack tiles if needed
-            if len(processed_tiles) > 1:
-                processed_tiles = torch.cat(processed_tiles, dim=0)
-            else:
-                processed_tiles = processed_tiles[0]
-            
-            return processed_tiles, tile_metadata
+            tiles = self.generate_tiles_with_overlap(image, tile_size, overlap_percent)
 
-    def get_optimal_workers(self, max_parallel_images):
-        """Determine optimal number of worker processes"""
-        available_cpu = cpu_count()
-        available_ram = psutil.virtual_memory().available / (1024**2)  # MB
-        
-        ram_based_workers = int(available_ram / self.MAX_RAM)
-        cpu_based_workers = max(1, available_cpu - 2)  # Leave 2 cores for system
-        
-        return min(max_parallel_images, ram_based_workers, cpu_based_workers)
-
-    def get_image_paths(self, input_path, image_extensions):
-        """Get list of image paths"""
-        if os.path.isfile(input_path):
-            return [input_path]
-            
-        image_paths = []
-        extensions = image_extensions.split(',')
-        for ext in extensions:
-            image_paths.extend(list(Path(input_path).glob(f'*{ext.strip()}')))
-        return sorted(image_paths)
-
-    def execute(self, input_path, model_name, input_type="single_image", tile_scheme="SIMPLE",
-                use_parallel=True, max_parallel_images=4, confidence_threshold=0.25,
-                tile_size=512, tile_overlap=64, maintain_aspect=True,
-                memory_limit_mb=2048, image_extensions=".tif,.tiff,.jpg,.png"):
-        """Main execution method"""
-        image_paths = self.get_image_paths(input_path, image_extensions)
-        
-        if not image_paths:
-            raise ValueError(f"No images found in {input_path}")
-        
-        all_processed_data = []
-        all_metadata = []
-        
-        if len(image_paths) == 1 or not use_parallel:
-            # Process sequentially
-            for img_path in image_paths:
-                processed_data, metadata = self.process_image(
-                    str(img_path), model_name, tile_scheme,
-                    tile_size, tile_overlap, memory_limit_mb
+            # Run detection on all tiles
+            all_detections = []
+            for i, tile_info in enumerate(tiles):
+                tile_detections = self.run_detection_on_tile(
+                    model,
+                    tile_info['tile'],
+                    tile_info['x_offset'],
+                    tile_info['y_offset'],
+                    confidence_threshold,
+                    device
                 )
-                all_processed_data.append(processed_data)
-                all_metadata.append(metadata)
-        else:
-            # Process in parallel
-            num_workers = self.get_optimal_workers(max_parallel_images)
-            with Pool(num_workers) as pool:
-                results = pool.starmap(
-                    self.process_image,
-                    [(str(path), model_name, tile_scheme, tile_size, 
-                      tile_overlap, memory_limit_mb) for path in image_paths]
-                )
-                for processed_data, metadata in results:
-                    all_processed_data.append(processed_data)
-                    all_metadata.append(metadata)
-        
-        # Stack results if multiple images
-        if len(all_processed_data) > 1:
-            all_processed_data = torch.stack(all_processed_data)
-        else:
-            all_processed_data = all_processed_data[0]
-            
-        return (all_processed_data, all_metadata)
+                all_detections.extend(tile_detections)
+
+                # Optionally save tiles
+                if save_tiles:
+                    os.makedirs(output_dir, exist_ok=True)
+                    tile_path = os.path.join(output_dir, f"tile_{i:04d}.jpg")
+                    cv2.imwrite(tile_path, cv2.cvtColor(tile_info['tile'], cv2.COLOR_RGB2BGR))
+
+            print(f"Total detections before NMS: {len(all_detections)}")
+
+            # Apply NMS to remove duplicates
+            filtered_detections = self.apply_nms_to_detections(all_detections, iou_threshold)
+
+            # Draw detections on original image
+            annotated_image = self.draw_detections_on_image(
+                image, filtered_detections, draw_labels, draw_conf
+            )
+
+            # Save annotated image
+            os.makedirs(output_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(input_image_path))[0]
+            output_image_path = os.path.join(output_dir, f"{base_name}_annotated.jpg")
+            cv2.imwrite(output_image_path, cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR))
+
+            # Save detections as JSON
+            detections_json_path = os.path.join(output_dir, f"{base_name}_detections.json")
+            with open(detections_json_path, 'w') as f:
+                json.dump({
+                    'image': input_image_path,
+                    'image_size': {'width': image.shape[1], 'height': image.shape[0]},
+                    'model': model_path,
+                    'tile_size': tile_size,
+                    'overlap_percent': overlap_percent,
+                    'confidence_threshold': confidence_threshold,
+                    'iou_threshold': iou_threshold,
+                    'num_detections': len(filtered_detections),
+                    'detections': filtered_detections
+                }, f, indent=2)
+
+            # Create status message
+            status = f"Success: {len(filtered_detections)} detections found"
+            print(f"\n{status}")
+            print(f"Annotated image saved to: {output_image_path}")
+            print(f"Detections JSON saved to: {detections_json_path}")
+
+            # Clean up
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+            return (output_image_path, detections_json_path, status)
+
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            return ("", "", error_msg)
+
+    FUNCTION = "run"
+    CATEGORY = "GIS/YOLO"
 
 NODE_CLASS_MAPPINGS = {
     "GISDetectionNode": GISDetectionNode
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "GISDetectionNode": "GIS YOLO Detection (Tiled)"
 }
